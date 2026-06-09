@@ -773,3 +773,282 @@ every file path you use.
 ```
 
 This grounds it in your exact environment so it doesn't suggest anything incompatible.
+
+
+2nd
+I have a QSE workflow notebook at [PATH].
+I also have my FOBA BBO + Trade + Enter timeline.
+
+The regime column is called 'regime' with values:
+'against', 'both', 'none', 'with'
+classifiedTrigger has values: 'QUOTEE', 'HITTEE', 'UNDERLYING'
+
+These are already joined to trades in trades_annotated (polars df).
+I need to join regime labels back to my BBO snapshot timeline
+so every BBO event gets the regime that was active at that timestamp.
+
+STEP 1: UNDERSTAND REGIME STRUCTURE — show me, STOP, wait
+
+# How long do regimes last?
+regime_durations = (
+    trades_annotated
+    .filter(pl.col('regime').is_not_null())
+    .sort('exchange_timestamp_')
+    .group_by_dynamic('exchange_timestamp_', 
+                       every='1m', 
+                       group_by='regime')
+    .agg(pl.count().alias('n_trades'))
+)
+
+# Regime transitions — when does 'against' start/end?
+# Show first 20 regime transition points
+regime_ts = (
+    trades_annotated
+    .filter(pl.col('regime').is_not_null())
+    .select(['exchange_timestamp_', 'regime', 
+             'classifiedTrigger'])
+    .sort('exchange_timestamp_')
+)
+print(regime_ts.head(20))
+
+# How many trades per regime?
+print(trades_annotated
+      .filter(pl.col('regime').is_not_null())
+      .group_by('regime')
+      .agg(pl.count())
+      .sort('regime'))
+
+# Key question: is regime a per-trade label or 
+# a time-period label?
+# Show 5 consecutive trades and their regime values
+print(regime_ts.head(5).to_pandas().to_string())
+
+STOP. Wait for my confirmation.
+
+STEP 2: JOIN REGIME TO BBO EVENTS
+
+# Forward-fill regime onto BBO snapshot timeline
+# Every BBO event gets the most recent regime label
+# from the trades that preceded it
+
+# First convert both to same timestamp units (ms)
+# Then merge_asof: for each BBO event, 
+# find the last trade before it and take its regime
+
+import pandas as pd
+
+bbo = foba_snap.copy()  
+# your SNAP df with ts_ms already computed
+
+trades_reg = (trades_annotated
+    .filter(pl.col('regime').is_not_null())
+    .select(['exchange_timestamp_', 'regime', 
+             'classifiedTrigger'])
+    .to_pandas()
+    .sort_values('exchange_timestamp_')
+)
+trades_reg['ts_ms'] = (trades_reg['exchange_timestamp_'] 
+                        // 1_000_000).astype(int)
+
+bbo_sorted = bbo.sort_values('ts_ms')
+
+bbo_with_regime = pd.merge_asof(
+    bbo_sorted,
+    trades_reg[['ts_ms','regime','classifiedTrigger']],
+    on='ts_ms',
+    direction='backward'  # last known regime
+)
+
+print("BBO regime distribution:")
+print(bbo_with_regime['regime'].value_counts())
+print(f"\nNull regime (before first trade): "
+      f"{bbo_with_regime['regime'].isna().sum()}")
+
+STOP. Show me distribution. Wait.
+
+STEP 3: CLASSIFY EVERY BBO TRANSITION INTO ACTION TYPE
+
+On bbo_with_regime, sorted by ts_ms then 
+foreign_sequence_number_, compute consecutive differences:
+
+bbo_with_regime = bbo_with_regime.sort_values(
+    ['ts_ms','foreign_sequence_number_'])
+
+# Only look at level_index_ == 0 (top of book)
+bbo_l0 = bbo_with_regime[
+    bbo_with_regime['level_index_']==0].copy()
+
+bbo_l0['prev_bid'] = bbo_l0['bid_price'].shift(1)
+bbo_l0['prev_ask'] = bbo_l0['ask_price'].shift(1)
+bbo_l0['prev_bid_vol'] = bbo_l0['bid_vol'].shift(1)
+bbo_l0['prev_ask_vol'] = bbo_l0['ask_vol'].shift(1)
+
+bbo_l0['bid_chg'] = bbo_l0['bid_price'] - bbo_l0['prev_bid']
+bbo_l0['ask_chg'] = bbo_l0['ask_price'] - bbo_l0['prev_ask']
+bbo_l0['bid_vol_chg'] = bbo_l0['bid_vol'] - bbo_l0['prev_bid_vol']
+bbo_l0['ask_vol_chg'] = bbo_l0['ask_vol'] - bbo_l0['prev_ask_vol']
+
+# Find tick size from data
+tick = bbo_l0['bid_chg'].abs()[
+       bbo_l0['bid_chg'].abs() > 0].mode()[0]
+print(f"Detected tick size: {tick}")
+
+def classify_action(row):
+    bc, ac = row['bid_chg'], row['ask_chg']
+    bvc, avc = row['bid_vol_chg'], row['ask_vol_chg']
+    t = tick
+    eps = t * 0.1
+    
+    # Both prices move same direction = full reprice
+    if bc > eps and ac > eps:
+        return 'REPRICE_UP'
+    if bc < -eps and ac < -eps:
+        return 'REPRICE_DOWN'
+    
+    # One side moves, other stable
+    if bc > eps and abs(ac) < eps:
+        return 'BID_DIME'      # bid improved
+    if bc < -eps and abs(ac) < eps:
+        return 'BID_FADE'      # bid retreated
+    if ac < -eps and abs(bc) < eps:
+        return 'ASK_DIME'      # ask improved
+    if ac > eps and abs(bc) < eps:
+        return 'ASK_FADE'      # ask retreated
+    
+    # Volume only changes (joins/cancels same level)
+    if abs(bc) < eps and abs(ac) < eps:
+        if bvc > 0:
+            return 'BID_JOIN'
+        if bvc < 0:
+            return 'BID_CANCEL'
+        if avc > 0:
+            return 'ASK_JOIN'
+        if avc < 0:
+            return 'ASK_CANCEL'
+    
+    return 'OTHER'
+
+bbo_l0['action_type'] = bbo_l0.apply(
+    classify_action, axis=1)
+
+print("\nAction type distribution:")
+print(bbo_l0['action_type'].value_counts())
+print("\nAction by regime:")
+print(pd.crosstab(bbo_l0['action_type'], 
+                  bbo_l0['regime'], 
+                  normalize='columns'))
+STOP. Show me. Wait.
+
+STEP 4: FORWARD MID CHANGE — the core measurement
+
+# For each BBO action event, compute future mid price change
+# Use merge_asof to find mid at T+100ms, T+500ms, T+1000ms, T+2000ms
+# NO loops. Vectorized only.
+
+bbo_l0['mid'] = (bbo_l0['bid_price'] + 
+                  bbo_l0['ask_price']) / 2
+
+mids = bbo_l0[['ts_ms','mid']].copy()
+
+for horizon_ms in [100, 500, 1000, 2000]:
+    future_mids = mids.copy()
+    future_mids['ts_ms_lookup'] = (future_mids['ts_ms'] 
+                                    - horizon_ms)
+    future_mids = future_mids.rename(
+        columns={'mid': f'mid_{horizon_ms}ms'})
+    
+    bbo_l0 = pd.merge_asof(
+        bbo_l0.sort_values('ts_ms'),
+        future_mids[['ts_ms_lookup', 
+                     f'mid_{horizon_ms}ms']]
+        .sort_values('ts_ms_lookup')
+        .rename(columns={'ts_ms_lookup':'ts_ms'}),
+        on='ts_ms',
+        direction='forward'
+    )
+    bbo_l0[f'mid_chg_{horizon_ms}ms'] = (
+        bbo_l0[f'mid_{horizon_ms}ms'] - bbo_l0['mid'])
+
+# Now also add IMC-specific flag
+# imc_bbo_affected_ = True means IMC caused this BBO change
+bbo_l0['imc_caused'] = bbo_l0['imc_bbo_affected_'].fillna(False)
+
+# MAIN RESULT TABLE
+result = (bbo_l0[bbo_l0['regime'].notna()]
+    .groupby(['action_type', 'regime', 'imc_caused'])
+    .agg(
+        n=('mid_chg_100ms', 'count'),
+        mid_chg_100=('mid_chg_100ms', 'mean'),
+        mid_chg_500=('mid_chg_500ms', 'mean'),
+        mid_chg_1000=('mid_chg_1000ms', 'mean'),
+        mid_chg_2000=('mid_chg_2000ms', 'mean'),
+        pct_pos_100=('mid_chg_100ms', lambda x:(x>0).mean()),
+        pct_pos_500=('mid_chg_500ms', lambda x:(x>0).mean()),
+        std_100=('mid_chg_100ms', 'std'),
+    )
+    .reset_index()
+)
+
+# ONLY TRUST n > 200
+result = result[result['n'] > 200]
+print(result.sort_values(
+    ['action_type','regime']).to_string())
+STOP. This is the main result. Wait for my review.
+
+STEP 5: PLOT — interactive, save as HTML
+
+Build 3 plotly figures:
+
+FIGURE 1: "Price Impact by Action Type — Regime Comparison"
+Subplots: one per action_type (6 subplots, 2 rows x 3 cols)
+For each subplot:
+  X axis: horizon [100, 500, 1000, 2000] ms
+  Y axis: mean mid change (INR)
+  Lines: one per regime, colored:
+    against = red
+    with = green  
+    both = orange
+    none = blue (dashed, baseline)
+  Add error bands: mean ± std/sqrt(n)
+  Annotate each line with n= sample size
+
+FIGURE 2: "% Positive Markout by Action Type — Regime Comparison"
+Same structure but Y axis = pct_pos_500
+Add horizontal dashed line at 0.50 (random baseline)
+If a line is above 0.50: that action in that regime 
+predicts UP price movement
+If below 0.50: predicts DOWN
+
+FIGURE 3: "IMC vs Market Action Impact by Regime"
+Split: imc_caused=True vs imc_caused=False
+For each regime, show: does IMC-caused action have 
+different price impact than market-caused action?
+This is the most actionable insight for the desk.
+
+Save all 3 to:
+~/price_impact_[INSTRUMENT]_[STRIKE]_fig1.html
+~/price_impact_[INSTRUMENT]_[STRIKE]_fig2.html  
+~/price_impact_[INSTRUMENT]_[STRIKE]_fig3.html
+
+STOP. Show file paths and sizes. Wait.
+
+STEP 6: REPLICATION — second instrument
+
+Repeat Steps 2-5 for [SECOND INSTRUMENT — I will tell you].
+Do NOT proceed until I confirm Step 5 results first.
+
+CRITICAL RULES:
+- Never loop where vectorized merge_asof works
+- Always print n per bucket before trusting any number
+- If any bucket has n < 200, drop it and say so
+- If regime=against has < 500 BBO events total, flag it
+- Show me actual numbers, not just plots
+- If polars/pandas conflict, convert to pandas early
+  and stay there
+
+over
+
+The One Thing to Ask Mentor Before Running
+"Is regime a per-trade label or a time-period label?"
+From the screenshot it looks per-trade — each trade has a regime. But if regime is assigned to time windows (e.g. "9:15-9:45 was an against regime") then the merge logic is different.
+This single question determines whether your merge_asof is correct or completely wrong. Ask it before running anything.
