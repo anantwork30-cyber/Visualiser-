@@ -1,0 +1,775 @@
+how to make good orderbook visualisation.
+
+Here's the final prompt. The key architectural change: **no downsampling ever, instead time-windowed loading** — you control the window, full fidelity within it.
+
+---
+
+## THE FINAL PROMPT
+
+```
+Read my notebook fully before doing anything:
+[PASTE NOTEBOOK PATH HERE]
+
+Understand every cell:
+- How run_sql and DREMIO work
+- Exact table names (OptionsForbaSnapshotKafka, 
+  OptionsFobaTradeKafka, OptionsFobaEnterKafka)
+- Exact column names as they appear in outputs
+- How timeline is built (SNAP + TRADE + ENTER merge)
+- The dedup logic on foba_enter
+- How TARGET_RDS_ID, FOBA_VERSION, DATE_ID are set
+- How exchange_timestamp_ units work (nanoseconds)
+
+Do NOT assume any column name. Read from notebook outputs.
+Do NOT proceed past any step without showing me output first.
+
+===================================================
+STEP 1: AUDIT — run and show me, then STOP and wait
+===================================================
+
+Run exactly this and show full output:
+
+# Timestamp units check
+sample_ts = timeline['exchange_timestamp_'].iloc[0]
+print(f"Sample timestamp raw value: {sample_ts}")
+print(f"Type: {type(sample_ts)}")
+print(f"If nanoseconds, this is: 
+      {pd.Timestamp(sample_ts, unit='ns')}")
+print(f"If milliseconds, this is: 
+      {pd.Timestamp(sample_ts, unit='ms')}")
+
+# Timeline audit
+print("\n=== TIMELINE ===")
+print(f"Total rows: {len(timeline)}")
+print(f"Columns: {list(timeline.columns)}")
+print(f"Event counts: 
+      {timeline['event_type'].value_counts().to_dict()}")
+print(f"Time range: {timeline['exchange_timestamp_'].min()} 
+      to {timeline['exchange_timestamp_'].max()}")
+
+# SNAP audit
+snaps = timeline[timeline['event_type']=='SNAP']
+print(f"\n=== SNAPS ===")
+print(f"Level distribution: 
+      {snaps['level_index_'].value_counts().to_dict()}")
+print(f"Columns with data (non-null > 0):")
+print(snaps[['bid_price','bid_vol','ask_price','ask_vol',
+             'imc_bid_price','imc_bid_vol',
+             'imc_ask_price','imc_ask_vol',
+             'bbo_affected_','imc_bbo_affected_']
+     ].notna().sum())
+
+# TRADE audit  
+trades = timeline[timeline['event_type']=='TRADE']
+print(f"\n=== TRADES ===")
+print(f"Total: {len(trades)}")
+print(trades[['exchange_timestamp_','trade_price','trade_vol',
+              'resting_side_','is_im_c_','is_im_caggressor_',
+              'levels_ahead_','orders_ahead_on_level_',
+              'volume_ahead_on_level_',
+              'bbo_bid','bbo_ask']
+     ].head(5).to_string())
+print(f"\nresting_side_ values: 
+      {trades['resting_side_'].value_counts().to_dict()}")
+print(f"is_im_c_ values: 
+      {trades['is_im_c_'].value_counts().to_dict()}")
+print(f"is_im_caggressor_ values: 
+      {trades['is_im_caggressor_'].value_counts().to_dict()}")
+
+# ENTER audit
+enters = timeline[timeline['event_type']=='ENTER']
+print(f"\n=== ENTERS ===")
+print(f"Total: {len(enters)}")
+print(enters[['exchange_timestamp_','order_price','order_vol',
+              'side_','enter_type_','levels_ahead_',
+              'orders_ahead_on_level_','volume_ahead_on_level_',
+              'bbo_bid','bbo_ask']
+     ].head(5).to_string())
+print(f"\nenter_type_ values: 
+      {enters['enter_type_'].value_counts().to_dict()}")
+print(f"side_ values: 
+      {enters['side_'].value_counts().to_dict()}")
+
+STOP. Show me this output. Wait for my confirmation.
+
+===================================================
+STEP 2: FUTURES — find and pull, then STOP and wait
+===================================================
+
+Ask yourself: which table in the IMC India data infrastructure
+contains futures BBO / top of book data for NSE equity futures?
+Check what tables are available under Sail.foba or 
+Trading.India or similar namespaces.
+
+Query to find futures instrument for RELIANCE:
+- Same date as DATE_ID
+- Product kind = FUTURE
+- Underlying = RELIANCE
+
+Show me:
+1. Which table you found futures data in
+2. The columns available
+3. A head(10) of the data
+4. Row count for the day
+5. Sample timestamp value (raw) so we can check units
+
+STOP. Wait for my confirmation before Step 3.
+
+===================================================
+STEP 3: TOP 5 LIQUID STRIKES — query and show, STOP
+===================================================
+
+Query Trading.India.DragonflyEnriched for DATE_ID,
+underlying = RELIANCE, product_kind = OPTION,
+tradeType NOT IN ('TRANSFER','HEDGE'),
+GROUP BY rdsId, bookName
+ORDER BY trade_count DESC
+LIMIT 5
+
+Show result as table with columns:
+rdsId, bookName, strike, kind(C/P), expiry, 
+trade_count, total_volume
+
+These 5 rdsIds will be our visualization targets.
+Also confirm: is TARGET_RDS_ID (165299 = 1320 CE) 
+in this top 5? If not, note it.
+
+STOP. Wait for my confirmation.
+
+===================================================
+STEP 4: LOAD ALL 5 STRIKES + FUTURES — show counts, STOP
+===================================================
+
+For each of the 5 rdsIds from Step 3:
+Re-run the exact same data pipeline as the notebook:
+  - FOBASnapshot pull (all 3 level_index_ 0,1,2)
+  - FOBATrade pull
+  - FOBAEnter pull with identical dedup logic
+  - Build timeline DataFrame with identical merge
+
+Use the SAME FOBA_VERSION as notebook.
+Use the SAME dedup logic exactly.
+
+Store results as:
+  all_timelines = {
+    rdsId: {"timeline": df, "strike": X, 
+            "kind": X, "label": "1320CE"}
+  }
+
+For futures: pull full day, store as futures_df.
+Convert ALL exchange_timestamp_ columns to 
+milliseconds integer ONCE here:
+  df['ts_ms'] = (df['exchange_timestamp_'] 
+                 // 1_000_000).astype(int)
+(Adjust divisor based on what you found in Step 1 
+about timestamp units)
+
+Print for each strike:
+  label, rdsId: SNAP=X TRADE=X ENTER=X 
+  ts_range=[first_ms to last_ms]
+Print futures: rows=X ts_range=[X to X]
+
+STOP. Wait for my confirmation.
+
+===================================================
+STEP 5: BUILD TIME-WINDOWED EXPORT FUNCTION
+===================================================
+
+This is the core architectural decision:
+NO DOWNSAMPLING EVER.
+Instead, we export a specific time window at full fidelity.
+The user controls the window. Default = first 30 minutes.
+
+Write this Python function EXACTLY:
+
+def export_window(
+    all_timelines,    # dict from Step 4
+    futures_df,       # futures DataFrame  
+    start_ms,         # window start in ms
+    end_ms,           # window end in ms
+    output_path="~/viz_orderbook.html"
+):
+    """
+    Export a self-contained HTML visualizer for the given
+    time window. Full fidelity — no downsampling.
+    Call this function whenever you want to change the window.
+    
+    Example usage after this is built:
+    
+    # First 30 min of day
+    export_window(all_timelines, futures_df, 
+                  start_ms, start_ms + 30*60*1000)
+    
+    # Specific window around a trade you noticed
+    export_window(all_timelines, futures_df,
+                  trade_ts_ms - 60000, trade_ts_ms + 60000)
+    
+    # Full day (will be large, only if needed)
+    export_window(all_timelines, futures_df,
+                  day_start_ms, day_end_ms)
+    """
+    
+    import json, os
+    from datetime import datetime
+    
+    export_data = {"meta": {}, "futures": [], "books": {}}
+    
+    # Meta
+    export_data["meta"] = {
+        "date": str(DATE_ID),
+        "underlying": "RELIANCE", 
+        "window_start_ms": start_ms,
+        "window_end_ms": end_ms,
+        "window_duration_min": 
+            round((end_ms - start_ms) / 60000, 1),
+        "generated_at": str(datetime.now()),
+        "strikes": [
+            {
+                "rdsId": rds_id,
+                "strike": info["strike"],
+                "kind": info["kind"],
+                "label": info["label"]
+            }
+            for rds_id, info in all_timelines.items()
+        ]
+    }
+    
+    # Futures: filter to window
+    fut_window = futures_df[
+        (futures_df['ts_ms'] >= start_ms) & 
+        (futures_df['ts_ms'] <= end_ms)
+    ]
+    export_data["futures"] = [
+        {
+            "ts": int(row.ts_ms),
+            "bp": float(row.bid_price) 
+                  if pd.notna(row.bid_price) else None,
+            "ap": float(row.ask_price) 
+                  if pd.notna(row.ask_price) else None,
+            "bv": int(row.bid_vol) 
+                  if pd.notna(row.bid_vol) else None,
+            "av": int(row.ask_vol) 
+                  if pd.notna(row.ask_vol) else None
+        }
+        for row in fut_window.itertuples()
+    ]
+    
+    # Each strike
+    for rds_id, info in all_timelines.items():
+        tl = info["timeline"]
+        window = tl[
+            (tl['ts_ms'] >= start_ms) & 
+            (tl['ts_ms'] <= end_ms)
+        ]
+        
+        snaps_w = window[window['event_type']=='SNAP']
+        trades_w = window[window['event_type']=='TRADE']
+        enters_w = window[window['event_type']=='ENTER']
+        
+        # Build snaps: one entry per (ts_ms, level_index_)
+        snaps_list = []
+        for ts_ms, grp in snaps_w.groupby('ts_ms'):
+            entry = {"ts": int(ts_ms), "levels": {}}
+            for _, row in grp.iterrows():
+                li = int(row['level_index_']) \
+                     if pd.notna(row['level_index_']) else None
+                if li is not None:
+                    entry["levels"][str(li)] = {
+                        "bp": float(row['bid_price']) 
+                              if pd.notna(row['bid_price']) 
+                              else None,
+                        "bv": int(row['bid_vol']) 
+                              if pd.notna(row['bid_vol']) 
+                              else None,
+                        "ap": float(row['ask_price']) 
+                              if pd.notna(row['ask_price']) 
+                              else None,
+                        "av": int(row['ask_vol']) 
+                              if pd.notna(row['ask_vol']) 
+                              else None
+                    }
+            # IMC quotes only at level 0
+            l0_rows = grp[grp['level_index_']==0]
+            if len(l0_rows) > 0:
+                r = l0_rows.iloc[0]
+                entry["imc_bp"] = float(r['imc_bid_price']) \
+                    if pd.notna(r.get('imc_bid_price')) else None
+                entry["imc_ap"] = float(r['imc_ask_price']) \
+                    if pd.notna(r.get('imc_ask_price')) else None
+                entry["bbo_aff"] = bool(r['bbo_affected_']) \
+                    if pd.notna(r.get('bbo_affected_')) else False
+                entry["imc_aff"] = bool(
+                    r['imc_bbo_affected_']) \
+                    if pd.notna(
+                        r.get('imc_bbo_affected_')) else False
+            snaps_list.append(entry)
+        
+        # Trades
+        trades_list = []
+        for _, row in trades_w.iterrows():
+            trades_list.append({
+                "ts": int(row['ts_ms']),
+                "fsn": int(row[
+                    'foreign_sequence_number_']) \
+                    if pd.notna(row[
+                    'foreign_sequence_number_']) else None,
+                "px": float(row['trade_price']) \
+                    if pd.notna(row['trade_price']) else None,
+                "vol": int(row['trade_vol']) \
+                    if pd.notna(row['trade_vol']) else None,
+                "side": str(row['resting_side_']) \
+                    if pd.notna(row['resting_side_']) else None,
+                "imc_c": bool(row['is_im_c_']) \
+                    if pd.notna(row['is_im_c_']) else False,
+                "imc_agg": bool(row['is_im_caggressor_']) \
+                    if pd.notna(
+                    row['is_im_caggressor_']) else False,
+                "lvls": int(row['levels_ahead_']) \
+                    if pd.notna(row['levels_ahead_']) else None,
+                "oaol": int(row['orders_ahead_on_level_']) \
+                    if pd.notna(
+                    row['orders_ahead_on_level_']) else None,
+                "vaol": float(row['volume_ahead_on_level_']) \
+                    if pd.notna(
+                    row['volume_ahead_on_level_']) else None,
+                "bb": float(row['bbo_bid']) \
+                    if pd.notna(row['bbo_bid']) else None,
+                "ba": float(row['bbo_ask']) \
+                    if pd.notna(row['bbo_ask']) else None
+            })
+        
+        # Enters
+        enters_list = []
+        for _, row in enters_w.iterrows():
+            enters_list.append({
+                "ts": int(row['ts_ms']),
+                "fsn": int(row[
+                    'foreign_sequence_number_']) \
+                    if pd.notna(row[
+                    'foreign_sequence_number_']) else None,
+                "px": float(row['order_price']) \
+                    if pd.notna(row['order_price']) else None,
+                "vol": int(row['order_vol']) \
+                    if pd.notna(row['order_vol']) else None,
+                "side": str(row['side_']) \
+                    if pd.notna(row['side_']) else None,
+                "etype": str(row['enter_type_']) \
+                    if pd.notna(row['enter_type_']) else None,
+                "imc": bool(row['is_im_c_']) \
+                    if pd.notna(row.get('is_im_c_')) else False,
+                "lvls": int(row['levels_ahead_']) \
+                    if pd.notna(row['levels_ahead_']) else None,
+                "oaol": int(row['orders_ahead_on_level_']) \
+                    if pd.notna(
+                    row['orders_ahead_on_level_']) else None,
+                "vaol": float(row['volume_ahead_on_level_']) \
+                    if pd.notna(
+                    row['volume_ahead_on_level_']) else None,
+                "bb": float(row['bbo_bid']) \
+                    if pd.notna(row['bbo_bid']) else None,
+                "ba": float(row['bbo_ask']) \
+                    if pd.notna(row['bbo_ask']) else None
+            })
+        
+        export_data["books"][str(rds_id)] = {
+            "snaps": snaps_list,
+            "trades": trades_list,
+            "enters": enters_list
+        }
+    
+    # Print size summary before building HTML
+    import sys
+    json_str = json.dumps(export_data, separators=(',',':'))
+    print(f"Window: {(end_ms-start_ms)/60000:.1f} minutes")
+    print(f"JSON size: {len(json_str)/1e6:.2f} MB")
+    for rds_id in all_timelines:
+        b = export_data["books"][str(rds_id)]
+        print(f"  {all_timelines[rds_id]['label']}: "
+              f"SNAP={len(b['snaps'])} "
+              f"TRADE={len(b['trades'])} "
+              f"ENTER={len(b['enters'])}")
+    print(f"  Futures: {len(export_data['futures'])}")
+    
+    # Build HTML (see Step 6 for HTML spec)
+    html = build_html(json_str, export_data["meta"])
+    
+    output_path = os.path.expanduser(output_path)
+    with open(output_path, 'w') as f:
+        f.write(html)
+    print(f"\nSaved to: {output_path}")
+    print(f"File size: {os.path.getsize(output_path)/1e6:.2f} MB")
+    return output_path
+
+# Also define these convenience wrappers:
+
+def get_day_start_end_ms(all_timelines):
+    """Get the ms timestamps for start and end of trading day"""
+    all_ts = []
+    for info in all_timelines.values():
+        all_ts.extend(info["timeline"]['ts_ms'].tolist())
+    return min(all_ts), max(all_ts)
+
+# Usage examples (print these so user knows how to use):
+print("""
+=== HOW TO USE ===
+# Get day boundaries
+day_start, day_end = get_day_start_end_ms(all_timelines)
+
+# First 30 minutes
+export_window(all_timelines, futures_df,
+              day_start, day_start + 30*60*1000)
+
+# Around a specific trade (trade_ts_ms ± 2 minutes)
+export_window(all_timelines, futures_df,
+              trade_ts_ms - 120000, trade_ts_ms + 120000)
+
+# Change the output file name
+export_window(all_timelines, futures_df,
+              day_start, day_start + 30*60*1000,
+              output_path="~/viz_morning.html")
+
+# To change strikes or date: re-run Steps 3 and 4,
+# then call export_window again.
+""")
+
+===================================================
+STEP 6: BUILD THE HTML — build_html() function
+===================================================
+
+Build this function: build_html(json_str, meta) -> str
+
+It returns a complete single-file HTML string.
+Embed json_str directly as: const DATA = {json_str};
+NO external files. NO fetch(). NO CDN libraries.
+Pure HTML + CSS + vanilla JavaScript only.
+
+=== VISUAL LAYOUT (dark theme #0d0d1a background) ===
+
+[HEADER BAR - 40px]
+  Left: "RELIANCE | {date} | {window_start} - {window_end}"
+  Right: keyboard shortcut hints in small grey text
+         "← → navigate | T next trade | 
+          E next enter | S next BBO change | 
+          F toggle futures"
+
+[FUTURES STRIP - 100px, collapsible with F key]
+  Canvas element, full width
+  Green line = futures bid, Red line = futures ask
+  Yellow vertical bands = ±500ms around any trade
+  Blue vertical cursor = current time position
+  Redraws cursor only on scrub (not full canvas)
+  X axis labels: HH:MM every 5 minutes
+
+[MAIN BOOK AREA - fills remaining height]
+  6 columns: 5 option strikes + 1 futures
+  Each column header: "{strike} {C/P}" bold white
+                      "{trade_count} trades today" small grey
+  
+  Each option ladder column:
+    3 rows for L0, L1, L2
+    Each row:
+      [bid_vol_bar][bid_price][ask_price][ask_vol_bar]
+      bid bar: green, grows left, max 100px
+      ask bar: red, grows right, max 100px
+      bar width = vol / max_vol_this_strike * 100px
+      max_vol_this_strike = precomputed on load
+      price text: white, monospace, right/left aligned
+      
+    IMC quote overlay (if imc_bid_price exists at L0):
+      cyan dashed border on bid bar
+      cyan dashed border on ask bar
+      
+    Trade markers below L2:
+      Show last 5 trades as colored rows
+      Format: "{HH:MM:SS.mmm} | {px} | {vol} 
+               | {side_icon} | {imc_icon}"
+      side_icon: "▲" red if resting_side=B (ask hit),
+                 "▼" blue if resting_side=S (bid hit)
+      imc_icon: "◆" yellow if is_im_c_==True, else ""
+      Click any trade row → populate detail panel
+      
+    Enter markers:
+      Show last 3 enters as small coloured text rows
+      "▶ {px} × {vol}" green if side=B, red if side=S
+      cyan if is_im_c==True
+
+  Futures column:
+    Single level showing current futures bid/ask/vol
+    Same bar format
+    Label: "FUTURES"
+
+[DETAIL PANEL - 180px, bottom left 60% width]
+  Shows on click of any event
+  Title: "{event_type} @ {HH:MM:SS.mmm}"
+  Grid of all fields for that event:
+    For TRADE: price, vol, resting_side, is_im_c,
+               is_im_caggressor, levels_ahead,
+               orders_ahead_on_level, 
+               volume_ahead_on_level,
+               bbo_bid at time, bbo_ask at time,
+               foreign_sequence_number
+    For ENTER: order_price, order_vol, side, enter_type,
+               is_im_c, levels_ahead,
+               orders_ahead_on_level,
+               volume_ahead_on_level,
+               bbo_bid, bbo_ask
+
+[SCRUBBER - 60px, bottom]
+  range input full width
+  min=0, max=total_events-1, step=1
+  Below it: "{current_index} / {total_events} | 
+             {HH:MM:SS.mmm} | {event_type}"
+  
+=== JS ARCHITECTURE (STRICT — do not deviate) ===
+
+const DATA = /* embedded JSON */;
+
+// ---- PRECOMPUTE ON LOAD (do once) ----
+let allEvents = [];   
+// merged sorted array of ALL events across all strikes
+// each entry: {ts, type, rdsId, dataIndex}
+// sorted by ts ASC, then by type order SNAP < ENTER < TRADE
+
+let maxVolPerStrike = {};  
+// {rdsId: {bid: maxBidVol, ask: maxAskVol}}
+// precomputed from ALL snaps in window
+
+let lastSnapState = {};    
+// {rdsId: {l0:{bp,bv,ap,av}, l1:..., l2:..., imc_bp, imc_ap}}
+// updated as we scrub forward
+
+let futuresCursor = 0;     
+// index into DATA.futures for current time
+
+let currentEventIdx = 0;
+
+// ---- TIMESTAMP INDEX ----
+// Binary search helper for O(log n) lookup
+function binarySearch(arr, target, key) {
+    let lo = 0, hi = arr.length - 1;
+    while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (arr[mid][key] < target) lo = mid + 1;
+        else if (arr[mid][key] > target) hi = mid - 1;
+        else return mid;
+    }
+    return lo;
+}
+
+// ---- RENDER (called every navigation) ----
+function renderAtIndex(idx) {
+    currentEventIdx = idx;
+    const evt = allEvents[idx];
+    
+    // Update book state up to this point
+    // (walk forward/back from last known state)
+    updateBookState(idx);
+    
+    // Update DOM — only changed elements
+    updateAllLadders();
+    updateFuturesCursor(evt.ts);
+    updateScrubberLabel(idx, evt);
+    updateTradeMarkers();
+    updateEnterMarkers();
+}
+
+// ---- DOM UPDATES ----
+// Each price/vol element has a unique ID:
+// bid-price-{rdsId}-{level} 
+// bid-vol-bar-{rdsId}-{level}
+// ask-price-{rdsId}-{level}
+// ask-vol-bar-{rdsId}-{level}
+// Update by getElementById — never innerHTML of parent
+
+// ---- KEYBOARD ----
+document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowRight') navigate(+1);
+    if (e.key === 'ArrowLeft')  navigate(-1);
+    if (e.key === 't' || e.key === 'T') nextOfType('TRADE');
+    if (e.key === 'e' || e.key === 'E') nextOfType('ENTER');
+    if (e.key === 's' || e.key === 'S') nextBBOChange();
+    if (e.key === 'f' || e.key === 'F') toggleFutures();
+    if (['1','2','3','4','5'].includes(e.key)) 
+        highlightStrike(parseInt(e.key)-1);
+});
+
+// ---- SCRUBBER ----
+// Debounce to requestAnimationFrame
+let rafPending = false;
+scrubberEl.addEventListener('input', () => {
+    if (!rafPending) {
+        rafPending = true;
+        requestAnimationFrame(() => {
+            renderAtIndex(parseInt(scrubberEl.value));
+            rafPending = false;
+        });
+    }
+});
+
+// ---- INIT ----
+window.addEventListener('load', () => {
+    buildAllEvents();
+    precomputeMaxVols();
+    buildFuturesCanvas();
+    renderAtIndex(0);
+});
+
+=== AFTER BUILDING build_html ===
+
+Test it by calling:
+day_start, day_end = get_day_start_end_ms(all_timelines)
+test_path = export_window(
+    all_timelines, futures_df,
+    day_start, day_start + 30*60*1000,
+    "~/viz_orderbook.html"
+)
+
+Verify:
+1. File exists and size > 200KB
+2. Open in browser and confirm no JS errors in console
+3. Confirm scrubber moves without lag
+4. Confirm T key jumps to next trade
+
+===================================================
+STEP 7: SERVE IT AND SHOW ME HOW TO ACCESS
+===================================================
+
+Run these commands in terminal and show me the output:
+
+# Kill any existing server on 8765
+pkill -f "http.server 8765" 2>/dev/null || true
+
+# Start server in background
+cd ~ && python3 -m http.server 8765 &
+SERVER_PID=$!
+echo "Server PID: $SERVER_PID"
+
+# Get the server IP
+echo "Server IP addresses:"
+hostname -I
+
+# Confirm file is accessible
+sleep 1
+curl -s -o /dev/null -w "%{http_code}" \
+  http://localhost:8765/viz_orderbook.html
+echo " <- HTTP status (200 = OK)"
+
+Then print exactly:
+"=== HOW TO VIEW ==="
+"1. In your browser, go to: 
+    http://[SERVER_IP]:8765/viz_orderbook.html"
+"   (replace [SERVER_IP] with the IP shown above)"
+"2. If on IMC network/VPN, use the internal IP"
+"3. The server runs until you kill it or restart kernel"
+"4. To stop server: kill [SERVER_PID]"
+"5. After re-exporting, just refresh the browser tab"
+"   (Ctrl+R or Cmd+R) — no need to restart server"
+
+Also tell me:
+- Is port 8765 likely to be open on the IMC firewall?
+- If not, what port should we use instead?
+- Is there a JupyterLab file browser way to open HTML 
+  directly without a server? 
+  (Hint: in JupyterLab you can sometimes open HTML via
+   the file browser directly in a new tab)
+
+===================================================
+STEP 8: TEACH ME THE WORKFLOW
+===================================================
+
+Print exactly this usage guide after everything works:
+
+"""
+=== YOUR WORKFLOW ===
+
+The data (all_timelines, futures_df) is loaded once.
+You never re-query Dremio unless you change date/instrument.
+
+TO CHANGE TIME WINDOW:
+  export_window(all_timelines, futures_df,
+                day_start + 60*60*1000,   # 1hr into day
+                day_start + 90*60*1000)   # to 1.5hr
+  # Then Ctrl+R in browser
+
+TO ZOOM INTO A SPECIFIC TRADE:
+  # Find a trade timestamp you want to inspect
+  trade_ts = trades_df['ts_ms'].iloc[42]  # example
+  export_window(all_timelines, futures_df,
+                trade_ts - 300_000,   # 5 min before
+                trade_ts + 300_000)   # 5 min after
+
+TO CHANGE TO A DIFFERENT DATE:
+  DATE_ID = 20260604           # change this
+  FOBA_VERSION = 'v0.0.XX'    # update if needed
+  # Re-run Steps 3 and 4 cells
+  # Then call export_window again
+
+TO ADD A DIFFERENT INSTRUMENT:
+  # Re-run Step 3 with a different underlying
+  # Or manually add an rdsId to the top-5 list
+
+TO SAVE MULTIPLE WINDOWS:
+  export_window(..., output_path="~/viz_morning.html")
+  export_window(..., output_path="~/viz_afternoon.html")
+  # Both accessible via http://[IP]:8765/viz_morning.html
+
+SERVER MANAGEMENT:
+  # Check if server is running:
+  ps aux | grep http.server
+  
+  # Restart server:
+  pkill -f "http.server 8765"
+  cd ~ && python3 -m http.server 8765 &
+  
+  # Use a different port if 8765 is blocked:
+  python3 -m http.server 9090 &
+"""
+
+===================================================
+CRITICAL RULES — never violate these
+===================================================
+
+1. NO downsampling of any kind. Ever.
+   Window size controls data volume, not sampling.
+
+2. NO external JS libraries. 
+   No plotly, d3, bokeh, chart.js, jquery, nothing.
+   Pure vanilla JS and CSS only.
+
+3. NO fetch() calls. 
+   Data embedded directly in HTML as const DATA = {...}
+
+4. NO ipywidgets or Jupyter display tricks.
+   The HTML file must work when opened directly in Chrome.
+
+5. NO innerHTML rewrite of ladder columns on scrub.
+   Only update individual elements by ID.
+
+6. requestAnimationFrame debounce on scrubber.
+   No direct render calls on input event.
+
+7. Show me output at the end of EVERY step.
+   Wait for my confirmation before the next step.
+   If a step fails, show the full error and stop.
+
+8. If a column name you expect is not in the data,
+   say so explicitly. Do not rename or guess.
+   Ask me which column to use instead.
+```
+
+---
+
+## One Extra Thing to Tell It
+
+At the very start, before pasting the prompt, add:
+
+```
+I am working on the IMC India JupyterLab server (ams-india). 
+I have terminal access. The server has Python 3, pandas, 
+polars, and standard libraries. I want the final output as 
+a .html file I can open via python3 http.server.
+Please be explicit about every terminal command and 
+every file path you use.
+```
+
+This grounds it in your exact environment so it doesn't suggest anything incompatible.
