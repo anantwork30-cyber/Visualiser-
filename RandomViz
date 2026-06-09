@@ -1155,3 +1155,698 @@ The One Thing to Ask Mentor Before Running
 "Is regime a per-trade label or a time-period label?"
 From the screenshot it looks per-trade — each trade has a regime. But if regime is assigned to time windows (e.g. "9:15-9:45 was an against regime") then the merge logic is different.
 This single question determines whether your merge_asof is correct or completely wrong. Ask it before running anything.
+
+
+
+
+
+final stuff 
+
+
+# QSE Regime × BBO Price Impact — Rigorous Analytical Framework
+
+---
+
+## PART 0: EPISTEMOLOGICAL FOUNDATION
+
+Before writing a single line of code, establish what you are actually measuring. Confusing these destroys everything downstream.
+
+**Three distinct claims this analysis can make:**
+
+| Claim Level | Statement | Requires |
+|---|---|---|
+| **Descriptive** | "In regime R, action A preceded mid moves of X bps on average" | Correct merge + sufficient n |
+| **Predictive** | "Observing action A in regime R predicts future mid direction" | Out-of-sample test, no lookahead |
+| **Causal** | "IMC quoting behavior *caused* the mid to move" | Counterfactual / natural experiment |
+
+**You are currently building Level 1 (descriptive) with aspirations toward Level 2. Never let a plot imply Level 3 without a causal identification strategy.**
+
+---
+
+## PART I: DATA INTEGRITY PROTOCOL — RUN BEFORE ANYTHING ELSE
+
+### I.1 — Regime Label Audit
+
+```python
+# ASSERTION 1: Regime is exhaustive on trades, not sparse
+regime_coverage = (
+    trades_annotated
+    .filter(pl.col('regime').is_not_null())
+    .shape[0] / trades_annotated.shape[0]
+)
+assert regime_coverage > 0.95, (
+    f"FAIL: Only {regime_coverage:.1%} of trades have regime. "
+    f"Is regime a time-window label assigned post-hoc? "
+    f"Sparse coverage means your merge_asof will forward-fill "
+    f"a stale regime across long BBO stretches."
+)
+
+# ASSERTION 2: Regime has no impossible transitions
+# (e.g. 'against' -> 'with' within 1ms is a data artifact)
+regime_ts = (
+    trades_annotated
+    .filter(pl.col('regime').is_not_null())
+    .sort('exchange_timestamp_')
+    .select(['exchange_timestamp_', 'regime'])
+    .to_pandas()
+)
+regime_ts['prev_regime'] = regime_ts['regime'].shift(1)
+regime_ts['dt_ms'] = (
+    regime_ts['exchange_timestamp_'].diff() / 1e6
+)
+
+fast_transitions = regime_ts[
+    (regime_ts['regime'] != regime_ts['prev_regime']) &
+    (regime_ts['dt_ms'] < 10)  # < 10ms transition
+]
+print(f"Fast regime transitions (< 10ms): "
+      f"{len(fast_transitions)}")
+print(fast_transitions[['exchange_timestamp_',
+                          'prev_regime', 'regime',
+                          'dt_ms']].head(20))
+# If this is > 5% of total transitions: STOP.
+# Your regime label is per-trade, not per-period.
+# The merge strategy must change.
+```
+
+**Critical decision tree from this output:**
+
+```
+regime_coverage > 95% AND fast_transitions < 5%?
+    YES → regime is a time-period label. 
+          merge_asof is valid as written.
+    
+    NO, coverage < 95%?
+        → Regime is sparse / event-driven.
+          You must identify regime WINDOWS first:
+          [t_start, t_end, regime_value]
+          Then use interval join, not merge_asof.
+    
+    NO, fast_transitions > 5%?
+        → Regime is per-trade, not per-period.
+          forward-fill will create phantom regimes
+          on BBO events that occurred between trades.
+          You need regime_window construction:
+          
+          regime_windows = (
+              regime_ts
+              .assign(
+                  regime_end=lambda df: 
+                      df['exchange_timestamp_'].shift(-1)
+              )
+              .rename(columns={
+                  'exchange_timestamp_': 'regime_start'
+              })
+          )
+          # Then: for each BBO event, find which 
+          # [regime_start, regime_end) interval it falls in.
+```
+
+---
+
+### I.2 — Timestamp Alignment Audit
+
+```python
+# ASSERTION 3: BBO and trade timestamps are in same epoch/units
+bbo_ts_range = (foba_snap['ts_ms'].min(), 
+                foba_snap['ts_ms'].max())
+trade_ts_ms = (trades_annotated
+               .select('exchange_timestamp_')
+               .to_pandas()['exchange_timestamp_'] 
+               // 1_000_000)
+trade_ts_range = (trade_ts_ms.min(), trade_ts_ms.max())
+
+print(f"BBO  range: {bbo_ts_range[0]} — {bbo_ts_range[1]}")
+print(f"Trade range: {trade_ts_range[0]} — {trade_ts_range[1]}")
+
+overlap_pct = (
+    min(bbo_ts_range[1], trade_ts_range[1]) -
+    max(bbo_ts_range[0], trade_ts_range[0])
+) / (bbo_ts_range[1] - bbo_ts_range[0])
+
+assert overlap_pct > 0.80, (
+    f"FAIL: Only {overlap_pct:.1%} temporal overlap. "
+    f"Unit mismatch? BBO in epoch-ms, trades in epoch-ns "
+    f"not yet divided? Check: {trade_ts_range}"
+)
+
+# ASSERTION 4: BBO events occur at plausible granularity
+bbo_dt = foba_snap['ts_ms'].diff().dropna()
+print(f"BBO inter-event times (ms): "
+      f"p1={bbo_dt.quantile(0.01):.1f}, "
+      f"p50={bbo_dt.quantile(0.50):.1f}, "
+      f"p99={bbo_dt.quantile(0.99):.1f}")
+# If p50 < 0.1ms: you may have duplicate timestamps.
+#   → group_by ts_ms and take last() before merging.
+# If p99 > 60_000ms: there are gaps > 1 min.
+#   → forward-filled regime across a gap is meaningless.
+#   → add: bbo_with_regime.loc[gap_mask, 'regime'] = NaN
+
+# ASSERTION 5: No BBO events before market open / after close
+# Adjust bounds for your exchange
+market_open_ms  = 9 * 3600_000 + 15 * 60_000   # 09:15 IST
+market_close_ms = 15 * 3600_000 + 30 * 60_000  # 15:30 IST
+day_ms = foba_snap['ts_ms'].min() - (
+    foba_snap['ts_ms'].min() % 86_400_000
+)
+bbo_oos = foba_snap[
+    (foba_snap['ts_ms'] < day_ms + market_open_ms) |
+    (foba_snap['ts_ms'] > day_ms + market_close_ms)
+]
+if len(bbo_oos) > 0:
+    print(f"WARNING: {len(bbo_oos)} BBO events outside "
+          f"market hours — likely test/stale data. Drop these.")
+```
+
+---
+
+### I.3 — BBO Structural Audit
+
+```python
+# ASSERTION 6: Bid <= Ask always (no crossed book)
+crossed = foba_snap[foba_snap['bid_price'] > 
+                     foba_snap['ask_price']]
+print(f"Crossed book events: {len(crossed)} "
+      f"({len(crossed)/len(foba_snap):.3%})")
+# > 0.1% of events = data quality issue.
+# Could indicate: stale snapshot, feed gap, 
+# different instruments mixed, or latency artifact.
+# These events must be dropped before spread/mid calculation.
+
+# ASSERTION 7: Spreads are non-negative and bounded
+foba_snap['spread'] = (foba_snap['ask_price'] - 
+                        foba_snap['bid_price'])
+spread_stats = foba_snap['spread'].describe(
+    percentiles=[.01,.05,.25,.5,.75,.95,.99])
+print(spread_stats)
+# Sanity checks:
+# - min spread >= 1 tick (detected later)
+# - p99 spread < 50 ticks (if > 50: liquidity crisis events)
+# - spread = 0: book is locked (valid but flag separately)
+
+locked_book = foba_snap[foba_snap['spread'] == 0]
+print(f"Locked book events: {len(locked_book)}")
+```
+
+---
+
+## PART II: MATHEMATICAL FRAMEWORK
+
+### II.1 — Formal Definitions
+
+Let the BBO timeline be a sequence of events:
+
+```
+E = {e_1, e_2, ..., e_N}  where  e_i = (t_i, b_i, a_i, V^b_i, V^a_i)
+```
+
+- `t_i` = timestamp in milliseconds (epoch)  
+- `b_i`, `a_i` = best bid and ask prices at event i  
+- `V^b_i`, `V^a_i` = bid and ask volumes at level 0  
+- `m_i = (b_i + a_i) / 2` = midprice at event i
+
+**Regime function** — the key object you are constructing:
+
+```
+R: ℝ (time) → {against, with, both, none, ∅}
+```
+
+If regime is per-period: R is a step function, piecewise constant.  
+If regime is per-trade: R is defined only at trade timestamps; 
+you must choose an interpolation rule (forward-fill = last-known).
+
+**Forward mid change at horizon h:**
+
+```
+Δm_i(h) = m(t_i + h) - m_i
+```
+
+where `m(t_i + h)` is the midprice at the first BBO event 
+at or after `t_i + h`.
+
+**Note:** This is a *realized* outcome, not a prediction. 
+It includes all market events between `t_i` and `t_i + h`, 
+including IMC's own subsequent actions. This matters for 
+interpretation.
+
+---
+
+### II.2 — Action Classification: Complete Decision Tree
+
+```python
+def classify_action(row, tick, eps_factor=0.1):
+    """
+    Fully deterministic classification. 
+    Every row gets exactly one label.
+    No label = 'OTHER' is a model failure, not a data property.
+    
+    If OTHER > 5% of events, the tick size is wrong
+    or the data has fractional-tick moves (corporate action?).
+    """
+    bc  = row['bid_chg']
+    ac  = row['ask_chg']
+    bvc = row['bid_vol_chg']
+    avc = row['ask_vol_chg']
+    eps = tick * eps_factor
+
+    # --- PRICE MOVES ---
+    # Symmetric reprice (market-wide move or full quote shift)
+    if bc > eps and ac > eps:
+        # Both sides improve? Unusual. Spread narrowing.
+        if abs(abs(bc) - abs(ac)) < eps:
+            return 'REPRICE_UP_SYMMETRIC'
+        return 'REPRICE_UP'
+    
+    if bc < -eps and ac < -eps:
+        if abs(abs(bc) - abs(ac)) < eps:
+            return 'REPRICE_DOWN_SYMMETRIC'
+        return 'REPRICE_DOWN'
+
+    # Spread change: one price moves, other anchored
+    if bc > eps and ac < -eps:
+        return 'SPREAD_NARROWING'   # both sides improve
+    
+    if bc < -eps and ac > eps:
+        return 'SPREAD_WIDENING'    # both sides retreat
+
+    # One-sided price improvement (diming = stepping ahead)
+    if bc > eps and abs(ac) < eps:
+        return 'BID_DIME'      # new best bid placed
+    
+    if bc < -eps and abs(ac) < eps:
+        return 'BID_FADE'      # best bid withdrawn/repriced down
+    
+    if ac < -eps and abs(bc) < eps:
+        return 'ASK_DIME'      # new best ask placed
+    
+    if ac > eps and abs(bc) < eps:
+        return 'ASK_FADE'      # best ask withdrawn/repriced up
+
+    # --- VOLUME ONLY MOVES (price stable) ---
+    if abs(bc) < eps and abs(ac) < eps:
+        # Priority: if both sides changed, bid takes precedence
+        # (rare — usually only one side changes per event)
+        if bvc > 0 and avc == 0:
+            return 'BID_JOIN'      # size added at best bid
+        if bvc < 0 and avc == 0:
+            return 'BID_CANCEL'    # size removed at best bid
+        if avc < 0 and bvc == 0:
+            return 'ASK_JOIN'      # size added at best ask
+        if avc > 0 and bvc == 0:
+            return 'ASK_CANCEL'    # size removed at best ask
+        if bvc > 0 and avc > 0:
+            return 'BOTH_JOIN'     # simultaneous adds (very rare)
+        if bvc < 0 and avc < 0:
+            return 'BOTH_CANCEL'   # simultaneous removes
+        if bvc > 0 and avc < 0:
+            return 'BID_JOIN_ASK_CANCEL'
+        if bvc < 0 and avc > 0:
+            return 'BID_CANCEL_ASK_JOIN'
+        # Volume genuinely unchanged — stale/duplicate event
+        return 'NO_CHANGE'
+
+    return 'OTHER'
+
+# VALIDATION: OTHER should be < 5%
+action_dist = bbo_l0['action_type'].value_counts(normalize=True)
+other_pct = action_dist.get('OTHER', 0)
+if other_pct > 0.05:
+    print(f"WARNING: {other_pct:.1%} events classified OTHER.")
+    print("Diagnosing...")
+    other_rows = bbo_l0[bbo_l0['action_type']=='OTHER']
+    print("Unique (bid_chg, ask_chg) combos in OTHER:")
+    print(other_rows.groupby(
+        [other_rows['bid_chg'].round(4),
+         other_rows['ask_chg'].round(4)]
+    ).size().sort_values(ascending=False).head(20))
+    # Common cause: fractional ticks from corporate action
+    # or price in wrong units (paise vs rupees)
+```
+
+---
+
+### II.3 — Forward Mid Measurement: The Lookahead Problem
+
+**THIS IS THE MOST COMMON BUG IN MARKOUT ANALYSIS.**
+
+```python
+# WRONG (lookahead bias):
+# bbo_l0['mid_future'] = bbo_l0['mid'].shift(-N)
+# This uses future rows, which are only available
+# after the fact. It looks correct but is not.
+
+# CORRECT (what you have in Step 4):
+# merge_asof backward on (ts_ms - horizon_ms)
+# This says: "at time t_i + h, what was the last known mid?"
+# But: does the merge_asof direction='forward' work as intended?
+
+# VERIFY: For horizon=100ms, check that mid_100ms 
+#         is always >= ts_ms (not behind it):
+horizon = 100
+sample = bbo_l0.sample(1000, random_state=42)
+# Re-merge for this sample:
+future_mids = bbo_l0[['ts_ms','mid']].copy()
+future_mids['ts_key'] = future_mids['ts_ms'] - horizon
+future_mids = future_mids.rename(
+    columns={'mid': 'mid_future_check',
+             'ts_key': 'ts_ms'})
+
+check = pd.merge_asof(
+    sample[['ts_ms','mid']].sort_values('ts_ms'),
+    future_mids[['ts_ms','mid_future_check']]
+    .sort_values('ts_ms'),
+    on='ts_ms',
+    direction='forward'
+)
+# The future mid should come from ts > ts_ms
+# Verify: mid_future_check timestamp > ts_ms for all rows
+print("Lookahead check (should all be True):")
+print((check['mid_future_check'].notna()).describe())
+
+# ADDITIONAL: handle end-of-day truncation
+# Events within [horizon] ms of close have no future mid
+# These will be NaN after merge. This is CORRECT behavior.
+# Do NOT fill them. Just report:
+for h in [100, 500, 1000, 2000]:
+    null_pct = bbo_l0[f'mid_chg_{h}ms'].isna().mean()
+    print(f"Horizon {h}ms: {null_pct:.1%} null "
+          f"(expected ~{h/390_000:.1%} from EOD truncation)")
+```
+
+---
+
+### II.4 — Statistical Validity Gates
+
+```python
+def validity_gate(df, group_cols, outcome_col, min_n=200,
+                   min_regime_n=500):
+    """
+    Before trusting any number in the result table,
+    it must pass these gates.
+    
+    Returns filtered df with validity flags.
+    """
+    stats = (df.groupby(group_cols)[outcome_col]
+               .agg(['count','mean','std','sem'])
+               .reset_index())
+    
+    # Gate 1: Minimum sample size
+    stats['pass_n'] = stats['count'] >= min_n
+    
+    # Gate 2: Confidence interval width relative to signal
+    # If CI > |mean|, the signal is noise
+    stats['ci_95'] = 1.96 * stats['sem']
+    stats['signal_to_noise'] = (
+        stats['mean'].abs() / stats['ci_95'].clip(lower=1e-10)
+    )
+    stats['pass_snr'] = stats['signal_to_noise'] > 1.0
+    
+    # Gate 3: Not dominated by a single timestamp
+    # (regime event cluster = not independent observations)
+    # Compute: what fraction of obs are in the most common
+    # 1-minute bucket?
+    concentration = (
+        df.assign(minute=df['ts_ms'] // 60_000)
+          .groupby(group_cols + ['minute'])
+          .size()
+          .reset_index(name='minute_n')
+          .groupby(group_cols)
+          .apply(lambda g: g['minute_n'].max() / g['minute_n'].sum())
+          .reset_index(name='max_minute_concentration')
+    )
+    stats = stats.merge(concentration, on=group_cols)
+    stats['pass_concentration'] = (
+        stats['max_minute_concentration'] < 0.50
+    )
+    # If > 50% of observations are in a single minute,
+    # you are measuring one event, not a pattern.
+    
+    # Gate 4: Stationarity check (rough)
+    # Split into first-half / second-half of day.
+    # If mean in first half vs second half differ by > 2 std,
+    # the effect is not stable across the day.
+    # (Implement as needed — placeholder flag)
+    stats['pass_stationarity'] = True  # TODO: implement
+    
+    stats['all_pass'] = (
+        stats['pass_n'] & 
+        stats['pass_snr'] & 
+        stats['pass_concentration']
+    )
+    
+    dropped = stats[~stats['all_pass']]
+    if len(dropped) > 0:
+        print(f"\nDROPPED {len(dropped)} buckets (failed gates):")
+        print(dropped[group_cols + ['count','signal_to_noise',
+                                     'max_minute_concentration',
+                                     'pass_n','pass_snr',
+                                     'pass_concentration']]
+              .to_string())
+    
+    return stats[stats['all_pass']]
+```
+
+---
+
+### II.5 — IMC Attribution: The Counterfactual Problem
+
+The IMC vs non-IMC split (Step 4, `imc_caused`) is the most actionable but most dangerous comparison.
+
+**What `imc_caused = True` actually measures:**
+
+```
+E[Δm(h) | action A, regime R, IMC caused it]
+```
+
+vs
+
+```
+E[Δm(h) | action A, regime R, market caused it]
+```
+
+**Why this comparison is confounded:**
+
+```python
+# DIAGNOSTIC: Are IMC-caused events clustered in specific 
+# regimes or times? If IMC only dimes in 'with' regime
+# and market only dimes in 'against', 
+# you are NOT comparing like-for-like.
+
+confound_check = pd.crosstab(
+    bbo_l0['imc_caused'],
+    bbo_l0['regime'],
+    normalize='index'   # % of each source by regime
+)
+print("IMC vs Market by regime distribution:")
+print(confound_check)
+
+# Also check time-of-day distribution:
+bbo_l0['hour'] = (bbo_l0['ts_ms'] % 86_400_000) // 3_600_000
+time_confound = pd.crosstab(
+    bbo_l0['imc_caused'],
+    bbo_l0['hour'],
+    normalize='index'
+)
+print("\nIMC vs Market by hour:")
+print(time_confound)
+
+# If IMC is concentrated in specific hours/regimes,
+# the comparison must be done WITHIN (action, regime, hour)
+# buckets, not marginally.
+```
+
+---
+
+## PART III: SCALABILITY ARCHITECTURE
+
+### III.1 — Parameterized Pipeline
+
+```python
+# All instrument-specific parameters live here.
+# Zero hardcoding anywhere else.
+
+INSTRUMENT_CONFIG = {
+    'NIFTY_24500CE': {
+        'tick_size': 0.05,        # detect or hardcode
+        'lot_size': 50,
+        'underlying': 'NIFTY',
+        'expiry': '2024-01-25',
+        'min_spread_ticks': 1,
+        'max_spread_ticks': 100,
+        'market_open_ms_intraday': 9 * 3600_000 + 15 * 60_000,
+        'market_close_ms_intraday': 15 * 3600_000 + 30 * 60_000,
+    },
+    'BANKNIFTY_47000PE': {
+        'tick_size': 0.05,
+        'lot_size': 15,
+        'underlying': 'BANKNIFTY',
+        'expiry': '2024-01-31',
+        'min_spread_ticks': 1,
+        'max_spread_ticks': 200,
+        'market_open_ms_intraday': 9 * 3600_000 + 15 * 60_000,
+        'market_close_ms_intraday': 15 * 3600_000 + 30 * 60_000,
+    }
+}
+
+HORIZONS_MS = [100, 500, 1000, 2000]
+MIN_N_PER_BUCKET = 200
+MIN_REGIME_N = 500
+EPS_FACTOR = 0.1  # fraction of tick for price change detection
+```
+
+### III.2 — Verifiable Intermediate Checkpoints
+
+```python
+CHECKPOINTS = {}
+
+def checkpoint(name, df, key_stats=None):
+    """
+    Save intermediate state at each step.
+    If you re-run and a checkpoint changes,
+    you know exactly where the pipeline diverged.
+    """
+    import hashlib, json
+    
+    shape = df.shape
+    col_hash = hashlib.md5(
+        str(sorted(df.columns.tolist())).encode()
+    ).hexdigest()[:8]
+    
+    if key_stats is None:
+        key_stats = {}
+    key_stats.update({
+        'rows': shape[0],
+        'cols': shape[1],
+        'col_hash': col_hash,
+    })
+    
+    CHECKPOINTS[name] = key_stats
+    print(f"\n✓ CHECKPOINT [{name}]: {key_stats}")
+    return df
+
+# Usage:
+bbo_with_regime = checkpoint(
+    'after_regime_join',
+    bbo_with_regime,
+    {
+        'null_regime_pct': bbo_with_regime['regime'].isna().mean(),
+        'regime_dist': bbo_with_regime['regime'].value_counts().to_dict()
+    }
+)
+```
+
+---
+
+## PART IV: THINGS THAT WILL GO WRONG — EXPLICIT LIST
+
+| # | Failure Mode | Detection | Fix |
+|---|---|---|---|
+| 1 | **Stale regime forward-fill across gap** | p99 gap between consecutive same-regime trades > 5 min | Nullify regime where gap > threshold |
+| 2 | **Duplicate BBO timestamps** | p50 inter-event time < 0.1ms | Group by ts_ms, keep last event |
+| 3 | **Mid at EOD = NaN for all h horizons** | Check null % matches expected EOD truncation | Drop these rows from markout analysis only |
+| 4 | **IMC/market split is regime-confounded** | Crosstab `imc_caused × regime` shows imbalance > 30pp | Stratify: only compare within (action, regime) |
+| 5 | **Tick size detection wrong** | `OTHER` > 5%, or tick detected as 0.1 when true is 0.05 | Check exchange tick table; hardcode |
+| 6 | **Crossed book corrupting mid** | `bid > ask` events > 0% | Drop crossed events before mid calculation |
+| 7 | **Regime transitions at trade boundaries only** | Fast transitions > 5% | Switch from merge_asof to interval join |
+| 8 | **Vol change = 0 every row** | BID_JOIN + ASK_JOIN + BID_CANCEL + ASK_CANCEL all near 0 | Check if `bid_vol` is snapshot (cumulative) not delta — needs `.diff()` |
+| 9 | **Concentration in single time window** | Single minute > 50% of bucket | Flag; do not report the number |
+| 10 | **Unit mismatch: bid_price in paise, mid in rupees** | Tick detected as 5.0 instead of 0.05 | Normalize all prices to same unit at ingestion |
+
+---
+
+## PART V: THE ONE QUESTION, FORMALIZED
+
+The question from your original note:
+
+> "Is regime a per-trade label or a time-period label?"
+
+Maps to this formal test:
+
+```python
+def regime_type_test(trades_annotated, alpha=0.05):
+    """
+    Tests whether regime can be treated as a time-period 
+    step function.
+    
+    If TRUE: merge_asof (forward-fill) is valid.
+    If FALSE: must build explicit regime windows.
+    """
+    regime_ts = (
+        trades_annotated
+        .filter(pl.col('regime').is_not_null())
+        .sort('exchange_timestamp_')
+        .select(['exchange_timestamp_', 'regime'])
+        .to_pandas()
+    )
+    
+    # Test: within a 1-second window, is regime constant?
+    regime_ts['second'] = (
+        regime_ts['exchange_timestamp_'] // 1_000_000_000
+    )
+    within_second_variation = (
+        regime_ts.groupby('second')['regime']
+        .nunique()
+    )
+    
+    pct_stable_seconds = (
+        within_second_variation == 1
+    ).mean()
+    
+    print(f"Seconds with constant regime: {pct_stable_seconds:.1%}")
+    print(f"Seconds with mixed regime:    "
+          f"{1-pct_stable_seconds:.1%}")
+    
+    if pct_stable_seconds > 0.95:
+        print("\nCONCLUSION: Regime is a time-period label.")
+        print("merge_asof forward-fill is VALID.")
+        regime_structure = 'period'
+    else:
+        print("\nCONCLUSION: Regime is per-trade label.")
+        print("merge_asof will create phantom assignments.")
+        print("Build explicit regime windows before joining.")
+        regime_structure = 'per_trade'
+    
+    return regime_structure
+
+regime_structure = regime_type_test(trades_annotated)
+# Store result; downstream code branches on this.
+```
+
+---
+
+## PART VI: EXECUTION ORDER WITH HARD STOPS
+
+```
+Step 0A: Run regime_type_test()           → STOP. Read output.
+Step 0B: Run all Part I assertions         → STOP. Fix any FAILs.
+Step 0C: Run timestamp alignment audit     → STOP. Fix unit mismatches.
+
+Step 1:  Build regime windows OR confirm   → STOP. Show distribution.
+         merge_asof is valid.
+
+Step 2:  Join regime to BBO                → STOP. Check null %, 
+                                             check regime dist,
+                                             spot-check 20 rows manually.
+
+Step 3:  Detect tick size                  → STOP. Confirm against
+                                             exchange spec.
+
+Step 4:  Classify BBO actions              → STOP. Check OTHER < 5%.
+                                             Verify NO_CHANGE is < 1%.
+
+Step 5:  Compute forward mids              → STOP. Run lookahead check.
+                                             Verify EOD null %.
+
+Step 6:  Run validity_gate() on all        → STOP. Report dropped buckets.
+         (action, regime, imc_caused) 
+         buckets.
+
+Step 7:  Build result table                → STOP. Main review.
+
+Step 8:  Build plots                       → STOP. Final review.
+
+Step 9:  Second instrument                 → Only after Step 8 confirmed.
+```
+
+Every STOP is non-negotiable. A plot built on a bad merge is a liability, not an insight.
+
