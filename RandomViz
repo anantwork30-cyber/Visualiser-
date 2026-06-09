@@ -1,3 +1,106 @@
+# Random Viz Ideas
+
+## 1. Synthetic LOB Simulator
+Animate a limit order book with Poisson arrivals.
+- Agents: market makers, trend followers, noise traders
+- Live depth ladder with animated fills
+- Mid price timeseries overlay
+- Sliders: arrival rate λ, tick size, order imbalance bias
+Stack: React + d3
+
+---
+
+## 2. Black-Scholes Greek Surfaces
+Real-time 3D surface plots for all Greeks as S and T vary.
+- Sliders: Spot, Strike, σ, r, T
+- Surfaces: Δ, Γ, ν, Θ, Vanna, Volga
+- Color scale = magnitude; highlight ATM ridge
+- Toggle Call vs Put
+Stack: React + Three.js or Plotly
+
+---
+
+## 3. Markov Regime Walker
+Synthetic return series driven by a hidden Markov model.
+- 3 regimes: trending, mean-reverting, high-vol chop
+- Color overlay on price chart shows hidden state
+- Side panel: transition matrix heatmap
+- Sliders for each regime's drift / vol / MR speed
+- "Shuffle" generates a new path
+Stack: React + recharts
+
+---
+
+## 4. Options Payoff Builder
+Drag-and-drop spread constructor.
+- Add Call/Put/Forward legs: strike, expiry, qty, L/S
+- P&L profile at expiry + overlay at chosen DTE (BS pricing)
+- Show: max gain, max loss, breakevens, net premium
+- Presets: straddle, strangle, butterfly, condor, ratio spread
+Stack: React + recharts
+
+---
+
+## 5. Vol Surface Interpolator
+Synthetic IV surface with controllable skew/term structure.
+- Axes: log-moneyness (x), DTE (y), IV (z)
+- Sliders: ATM vol, skew, convexity, term structure slope
+- Models: parametric SVI, flat baseline, cubic spline
+- Highlight calendar arb violations in red
+Stack: React + d3
+
+---
+
+## 6. Poisson Order Arrival Animation
+Live animation of bid/ask/cancel arrivals on timeline.
+- Each event flies across screen as coloured particle
+- Bid=green, Ask=red, Cancel=grey, Market=yellow
+- Rolling inter-arrival histogram updates live
+- Sliders: λ_bid, λ_ask, λ_cancel
+- Breadometer = current imbalance ratio
+Stack: React + requestAnimationFrame
+
+---
+
+## 7. Martingale Drift Tester (Synthetic)
+Generate synthetic paths, test for serial correlation live.
+- Top: price path (GBM, mean-reverting, or trending)
+- Bottom: rolling autocorrelation at lag 1/5/10
+- Variance ratio test plotted vs null band
+- Toggle: add alpha signal → watch autocorr appear
+Stack: React + recharts
+
+---
+
+## 8. Gamma / Theta Bleed Visualizer
+Show the daily P&L decomposition of a delta-hedged options book.
+- Synthetic spot path + hedge rebalance at fixed intervals
+- Bar chart per day: gamma P&L vs theta bleed
+- Sliders: σ_realized vs σ_implied, hedge frequency
+- Running P&L curve; mark where gamma > theta
+Stack: React + recharts
+
+---
+
+## 9. Queue Position Simulator
+Model fill probability as a function of queue position.
+- Poisson fills ahead of you + Poisson cancels
+- P(fill | position k, λ_trade, λ_cancel) over time
+- Heatmap: position (x) vs time horizon (y) → fill prob
+- Show optimal join threshold given adverse selection cost
+Stack: React + d3 heatmap
+
+---
+
+## 10. Correlation / Copula Explorer
+Visualize tail dependence structures.
+- Scatter of 2 synthetic asset returns
+- Dropdown: Gaussian, t-copula (df slider), Clayton, Gumbel
+- Overlay: 99th percentile ellipse, tail concordance ratio
+- Show how tail dependence changes as ν → ∞
+Stack: React + d3
+
+
 how to make good orderbook visualisation.
 
 Here's the final prompt. The key architectural change: **no downsampling ever, instead time-windowed loading** — you control the window, full fidelity within it.
