@@ -1850,3 +1850,584 @@ Step 9:  Second instrument                 → Only after Step 8 confirmed.
 
 Every STOP is non-negotiable. A plot built on a bad merge is a liability, not an insight.
 
+
+
+
+
+
+
+
+
+
+after 1800 fun comes
+
+
+
+You are fixing regime_orderbook_microscope_viewer_fixed.ipynb for NSE India
+options market making analysis. Apply every fix listed precisely.
+Do not change anything not listed.
+
+================================================================
+TIMESTAMP REFERENCE — READ BEFORE TOUCHING ANY TIMESTAMP CODE
+================================================================
+
+NSE India FOBA tables have these time columns. Use them correctly:
+
+  exchange_timestamp_  : nanoseconds, set by NSE exchange when event matched.
+                         USE THIS for cross-book causal ordering and markout.
+  timestamp_           : nanoseconds, IMC receive time. Has network latency.
+                         OK for within-book ordering only.
+  received_            : nanoseconds, another IMC receive timestamp. Avoid.
+  foreign_sequence_number_ : exchange sequence number, INTEGER not time.
+                         Use only as sort tiebreaker within one book.
+                         NEVER use as a timestamp or divide it.
+
+In snap_wide these are renamed:
+  snap_exchange_timestamp  ← from exchange_timestamp_
+  snap_timestamp           ← from timestamp_  (IMC receive)
+  snap_exchange_sequence_number ← from exchange_sequence_number_
+
+In get_micro_events(), t_ns is set via find_col priority:
+  ["event_exchange_timestamp", "event_timestamp", "exchange_timestamp_", "timestamp_"]
+This correctly prefers exchange time. DO NOT change this priority order.
+
+In Dragonfly:
+  timestampNanos : nanoseconds since epoch. USE THIS for all dfly asof joins.
+  timestamp      : milliseconds. Less precise. Do not use for joins.
+
+The signal table timestamp_ns is already converted: raw_ms * 1_000_000 = ns.
+The annotate_dragonfly_with_regime asof join uses:
+  left_on="timestampNanos", right_on="timestamp_ns" — CORRECT, do not touch.
+
+The markout computation in compute_toxicity uses t_ns which resolves to
+event_exchange_timestamp when available — CORRECT, do not touch.
+
+DO NOT change any timestamp column selection, sort keys, or asof join keys
+unless explicitly listed in the bugs below.
+
+================================================================
+SECTION 1: PYTHON DATA PIPELINE BUGS
+================================================================
+
+--- BUG 1: pull_dragonfly_one_book hardcodes product_kind == "OPTION" ---
+
+CURRENT:
+    def pull_dragonfly_one_book(rds_id: int) -> pl.DataFrame:
+        dfly = (
+            DremioClient().get_data(
+                ...
+                pasql_filter_conditions=[
+                    ...
+                    lambda pf: pf["product_kind"] == "OPTION",
+                    ...
+                ],
+            )
+        )
+
+FIX — add instrument_type parameter, switch kind_candidates:
+    def pull_dragonfly_one_book(rds_id: int,
+                                instrument_type: str = "OPTION") -> pl.DataFrame:
+        if instrument_type in ("FUTURE", "FUTURES"):
+            kind_candidates = ["FUTURE","FUTURES","STOCK_FUTURE","INDEX_FUTURE"]
+        else:
+            kind_candidates = ["OPTION", "OPTIONS"]
+        dfly = (
+            DremioClient().get_data(
+                ...
+                pasql_filter_conditions=[
+                    ...
+                    lambda pf: pf["product_kind"].isin(kind_candidates),
+                    ...
+                ],
+            )
+        )
+
+ALSO find the call site in build_one_book_events():
+    dfly = pull_dragonfly_one_book(rds_id)
+Change to:
+    instrument_type = book_row.get("instrument_type", "OPTION")
+    dfly = pull_dragonfly_one_book(rds_id, instrument_type=instrument_type)
+
+--- BUG 2: join_dfly_foba_trade only tries crossId, no tradeId fallback ---
+
+CURRENT join_dfly_foba_trade() body:
+    trades_foba = (
+        trades_annotated
+        .with_row_index("_row_id")
+        .join(foba_trade, left_on="dfly_cross_id",
+              right_on="foba_trade_id", how="left", suffix="_foba")
+        .with_columns(
+            pl.col("foreign_sequence_number_").is_not_null()
+            .alias("matched_foba_trade")
+        )
+    )
+    return trades_foba
+
+FIX — replace entire body:
+    attempts = [
+        ("dfly_cross_id",  "foba_trade_id", "crossId→trade_id"),
+        ("dfly_trade_id",  "foba_trade_id", "tradeId→trade_id"),
+    ]
+    best = None
+    for left_on, right_on, label in attempts:
+        try:
+            joined = (
+                trades_annotated
+                .with_row_index("_row_id")
+                .join(foba_trade, left_on=left_on, right_on=right_on,
+                      how="left", suffix="_foba")
+                .with_columns(
+                    pl.col("foreign_sequence_number_").is_not_null()
+                    .alias("matched_foba_trade")
+                )
+            )
+            matched = int(joined["matched_foba_trade"].sum())
+            print(f"  Join {label}: {matched}/{joined.height} matched")
+            if best is None or matched > best[0]:
+                best = (matched, label, joined)
+        except Exception as e:
+            print(f"  Failed {label}: {str(e)[:200]}")
+            continue
+    return best[2] if best else trades_annotated.with_columns(
+        pl.lit(False).alias("matched_foba_trade")
+    )
+
+--- BUG 3: FOBA trade price /1e9 should be /1e6 ---
+
+LOCATION: pull_foba_trade_one_book(), with_columns price scaling block
+
+CURRENT:
+    (pl.col("price_") / 1_000_000_000).alias("foba_trade_price"),
+    (pl.col("best_bid_price_") / 1_000_000_000).alias("foba_best_bid"),
+    (pl.col("best_ask_price_") / 1_000_000_000).alias("foba_best_ask"),
+    (pl.col("imc_best_bid_price_") / 1_000_000_000).alias("foba_imc_best_bid"),
+    (pl.col("imc_best_ask_price_") / 1_000_000_000).alias("foba_imc_best_ask"),
+
+FIX:
+    (pl.col("price_") / 1_000_000).alias("foba_trade_price"),
+    (pl.col("best_bid_price_") / 1_000_000).alias("foba_best_bid"),
+    (pl.col("best_ask_price_") / 1_000_000).alias("foba_best_ask"),
+    (pl.col("imc_best_bid_price_") / 1_000_000).alias("foba_imc_best_bid"),
+    (pl.col("imc_best_ask_price_") / 1_000_000).alias("foba_imc_best_ask"),
+
+IMPORTANT: pull_foba_snapshot_one_book() divides by 1_000_000_000.
+That is CORRECT and must NOT be changed.
+Confirmed from actual data: snap prices ~74 INR options, ~3875 INR futures.
+
+--- BUG 4: Snapshot price floating point noise ---
+
+LOCATION: pull_foba_snapshot_one_book(), with_columns scaling block
+
+Confirmed from data: prices display as 74.10000000000001, 3873.000000000004
+
+CURRENT:
+    (pl.col("bid_price_") / 1_000_000_000).alias("snap_bid_price"),
+    (pl.col("ask_price_") / 1_000_000_000).alias("snap_ask_price"),
+    (pl.col("imc_bid_price_") / 1_000_000_000).alias("snap_imc_bid_price"),
+    (pl.col("imc_ask_price_") / 1_000_000_000).alias("snap_imc_ask_price"),
+
+FIX — add .round(4):
+    (pl.col("bid_price_") / 1_000_000_000).round(4).alias("snap_bid_price"),
+    (pl.col("ask_price_") / 1_000_000_000).round(4).alias("snap_ask_price"),
+    (pl.col("imc_bid_price_") / 1_000_000_000).round(4).alias("snap_imc_bid_price"),
+    (pl.col("imc_ask_price_") / 1_000_000_000).round(4).alias("snap_imc_ask_price"),
+
+Use round(4) not round(2) — NSE options can have sub-paise tick sizes.
+Volume columns (bid_vol_, ask_vol_, imc_bid_vol_, imc_ask_vol_) need
+NO scaling — they are already in shares. Do not touch them.
+
+--- BUG 5: passive_direction not normalizing "B"→"BUY", "S"→"SELL" ---
+
+LOCATION: build_trade_activity(), with_columns computing passive_direction
+
+CURRENT (approximately):
+    pl.when(pl.col("passiveSide").is_not_null())
+    .then(pl.col("passiveSide").str.to_uppercase())
+    ...
+    .alias("passive_direction")
+
+Problem: .str.to_uppercase() on "b"→"B", "s"→"S".
+Any downstream check for == "BUY" always returns False → regime wrong.
+
+FIX — add helper function before build_trade_activity:
+    def _norm_side(col_name: str) -> pl.Expr:
+        x = pl.col(col_name).cast(pl.Utf8).str.to_uppercase()
+        return (
+            pl.when(x.is_in(["BUY", "B", "BID"])).then(pl.lit("BUY"))
+            .when(x.is_in(["SELL", "S", "ASK", "OFFER"])).then(pl.lit("SELL"))
+            .otherwise(pl.lit(None, dtype=pl.Utf8))
+        )
+
+Then replace the passive_direction expression:
+    pl.when(pl.col("passiveSide").is_not_null())
+    .then(_norm_side("passiveSide"))
+    .when(pl.col("resting_side_").is_not_null())
+    .then(_norm_side("resting_side_"))
+    .otherwise(pl.lit(None, dtype=pl.Utf8))
+    .alias("passive_direction")
+
+--- BUG 6: _book_mid_timeline uses wrong column names ---
+
+LOCATION: _book_mid_timeline(ev_book)
+
+CURRENT:
+    mid = ev_book.filter(
+        (pl.col("l0_bid_price") > 0) & (pl.col("l0_ask_price") > 0)
+    ).select(
+        pl.col("t_ns"),
+        ((pl.col("l0_bid_price") + pl.col("l0_ask_price")) / 2).alias("mid"),
+        (pl.col("l0_ask_price") - pl.col("l0_bid_price")).alias("spread"),
+    ).sort("t_ns")
+
+FIX:
+    mid = ev_book.filter(
+        (pl.col("snap_l0_bid_price") > 0) & (pl.col("snap_l0_ask_price") > 0)
+    ).select(
+        pl.col("t_ns"),
+        ((pl.col("snap_l0_bid_price") + pl.col("snap_l0_ask_price")) / 2).alias("mid"),
+        (pl.col("snap_l0_ask_price") - pl.col("snap_l0_bid_price")).alias("spread"),
+    ).sort("t_ns")
+
+--- BUG 7: get_micro_events BOOK event price uses wrong column names ---
+
+LOCATION: get_micro_events(), final out.with_columns(), "price" alias
+
+CURRENT:
+    pl.when(pl.col("activity_type") == "TRADE").then(pl.col("trade_price"))
+    .otherwise(
+        pl.when(pl.col("book_side") == "BID").then(pl.col("l0_bid_price"))
+        .otherwise(pl.col("l0_ask_price"))
+    ).alias("price")
+
+FIX:
+    pl.when(pl.col("activity_type") == "TRADE").then(pl.col("trade_price"))
+    .otherwise(
+        pl.when(pl.col("book_side") == "BID")
+        .then(pl.col("snap_l0_bid_price"))
+        .otherwise(pl.col("snap_l0_ask_price"))
+    ).alias("price")
+
+--- BUG 8: compute_toxicity _odir uses passive side → markout signs flipped ---
+
+LOCATION: compute_toxicity(), per-horizon loop, _odir computation
+
+CURRENT:
+    tr = tr.with_columns(
+        pl.when(pl.col("side").cast(pl.Utf8).str.to_uppercase()
+                .str.starts_with("B")).then(1)
+        .when(pl.col("side").cast(pl.Utf8).str.to_uppercase()
+              .str.starts_with("S")).then(-1)
+        .otherwise(0).alias("_odir")
+    )
+
+Problem: "side" is passive side. Passive BUY means aggressor is SELL.
+Using passive side flips sign of every markout.
+
+FIX:
+    _dir_col = next(
+        (c for c in ["event_direction","aggressive_direction","side"]
+         if c in tr.columns),
+        "side"
+    )
+    tr = tr.with_columns(
+        pl.when(pl.col(_dir_col).cast(pl.Utf8).str.to_uppercase()
+                .str.starts_with("B")).then(1)
+        .when(pl.col(_dir_col).cast(pl.Utf8).str.to_uppercase()
+              .str.starts_with("S")).then(-1)
+        .otherwise(0).alias("_odir")
+    )
+
+--- BUG 9: _normalize_qty multiplies Dragonfly trade volumes by lot size ---
+
+LOCATION: _normalize_qty(df), inside the per-fidv for loop
+
+CURRENT:
+    tvals = sub.filter(pl.col(sharesc) > 0)[sharesc].to_list() \
+            if sharesc else []
+    trade_factor, tnote = _decide_factor(tvals, lot)
+
+Problem: Dragonfly volume is already in shares.
+LT: values are 175, 350, 525... (multiples of lot=175).
+_decide_factor sees all multiples of 175, returns factor=175.
+Then code does volume * 175 → 175*175 = 30625 per lot. Wrong.
+This breaks ALL stocks — RIL lot=500, HDFC lot=300 etc all affected.
+
+FIX — force trade factor to 1, only snap factor uses _decide_factor:
+    tvals = sub.filter(pl.col(sharesc) > 0)[sharesc].to_list() \
+            if sharesc else []
+    trade_factor, tnote = 1, "dragonfly-already-in-shares"
+    # DO NOT call _decide_factor for trade volumes
+
+The snap factor (_snapf) for FOBA depth volumes is fine as-is —
+FOBA depth qty may be in lot counts. Only trade volumes must be 1.
+
+--- BUG 10: _event_record price/bbo rounding ---
+
+LOCATION: _event_record(r, t0_ns, idx), the return dict
+
+CURRENT:
+    "px": r.get("price"),
+    ...
+    "bb": r.get("bbo_bid"),
+    "ba": r.get("bbo_ask"),
+
+FIX:
+    def _r2(v):
+        return round(float(v), 2) if v is not None else None
+    ...
+    "px": _r2(r.get("price")),
+    ...
+    "bb": _r2(r.get("bbo_bid")),
+    "ba": _r2(r.get("bbo_ask")),
+
+================================================================
+SECTION 2: JAVASCRIPT BUGS
+================================================================
+
+--- BUG 11: renderFut divides cursor time by 1e9 — future mid frozen ---
+
+LOCATION: function renderFut(i) in MICRO_HTML_TEMPLATE JavaScript
+
+CURRENT:
+    var li=bsearchLE(ch.bt.map(function(t){return t;}),(cur)/1e9);
+
+Problem: cur is milliseconds from _istms(). ch.bt values are also
+milliseconds. Dividing cur by 1e9 gives ~0, bsearchLE always returns
+index 0, future mid price is frozen at first value regardless of cursor.
+
+FIX — remove the /1e9:
+    var li=bsearchLE(ch.bt.map(function(t){return t;}),cur);
+
+--- BUG 12: cardTape shows "x" with no qty on BOOK events ---
+
+LOCATION: function cardTape(i,b) in MICRO_HTML_TEMPLATE JavaScript
+
+CURRENT:
+    fpx(e.px)+'x'+(e.qty||'')
+
+FIX:
+    fpx(e.px)+(e.qty!=null?'x'+e.qty:'')
+
+--- BUG 13: _book_snapshots uses l{l}_bid_price not snap_l{l}_bid_price ---
+            This is the PRIMARY cause of bbo=[-,-] everywhere
+
+LOCATION: _book_snapshots(ev_book, t0_ns) in Python
+
+CURRENT:
+    bid = [{"px": r[f"l{l}_bid_price"], "qty": int(r[f"l{l}_bid_vol"])}
+           for l in (0,1,2)
+           if r[f"l{l}_bid_price"] and r[f"l{l}_bid_price"] > 0]
+    ask = [{"px": r[f"l{l}_ask_price"], "qty": int(r[f"l{l}_ask_vol"])}
+           for l in (0,1,2)
+           if r[f"l{l}_ask_price"] and r[f"l{l}_ask_price"] > 0]
+
+FIX:
+    bid = [{"px": round(float(r[f"snap_l{l}_bid_price"]), 2),
+            "qty": int(r.get(f"snap_l{l}_bid_vol") or 0)}
+           for l in (0,1,2)
+           if r.get(f"snap_l{l}_bid_price") and r[f"snap_l{l}_bid_price"] > 0]
+    ask = [{"px": round(float(r[f"snap_l{l}_ask_price"]), 2),
+            "qty": int(r.get(f"snap_l{l}_ask_vol") or 0)}
+           for l in (0,1,2)
+           if r.get(f"snap_l{l}_ask_price") and r[f"snap_l{l}_ask_price"] > 0]
+    bbo = [bid[0]["px"] if bid else None, ask[0]["px"] if ask else None]
+    mid = round((bbo[0]+bbo[1])/2, 2) if bbo[0] and bbo[1] else None
+    spread = round(bbo[1]-bbo[0], 4) if bbo[0] and bbo[1] else None
+
+================================================================
+SECTION 3: CONFIRMED CORRECT — DO NOT TOUCH
+================================================================
+
+These have been verified correct from actual data output:
+
+TIMESTAMPS:
+- annotate_dragonfly_with_regime: left_on="timestampNanos",
+  right_on="timestamp_ns" ✓
+- build_book_events signal asof: left_on="event_timestamp",
+  right_on="timestamp_ns" ✓
+- compute_toxicity uses t_ns resolved from event_exchange_timestamp
+  with fallback to event_timestamp ✓
+- foreign_sequence_number_ used only as sort tiebreaker, never as time ✓
+- Signal raw_ms * 1_000_000 → timestamp_ns conversion ✓
+
+PRICE SCALING:
+- pull_foba_snapshot_one_book: /1_000_000_000 ✓
+  (verified: option snaps ~74 INR, future snaps ~3875 INR)
+- Dragonfly price columns: no scaling needed, already in INR ✓
+- FOBA shares_ column: no scaling, already in shares ✓
+- Snapshot bid_vol_/ask_vol_/imc_bid_vol_/imc_ask_vol_: no scaling ✓
+  (verified: volumes are 175.0, 350.0, 525.0 — correct share multiples)
+
+LOGIC:
+- build_foba_snap_wide() 3-level join with dedup per level ✓
+- build_book_events sort and concat logic ✓
+- _normalize_qty snap factor (_snapf) using _decide_factor ✓
+  (only trade factor must be forced to 1, snap factor stays)
+- TOX_HORIZONS_S = (1,5,10,30,60) ✓
+- MARKOUT_H = (1,10) ✓
+- HTML template CSS, layout, all non-listed JS functions ✓
+
+================================================================
+SECTION 4: VERIFICATION CELL
+================================================================
+
+After running all books, add this cell:
+
+    print("=== VERIFICATION CHECKS ===")
+    r1 = book_results[1]
+    
+    # 1. FOBA trade prices — expect ~74 for LT options, not 74000
+    tp = (r1["trades_foba"]
+          .filter(pl.col("foba_trade_price").is_not_null())
+          ["foba_trade_price"].head(3).to_list())
+    print(f"FOBA trade prices (expect ~74 INR): {[round(x,2) for x in tp]}")
+    
+    # 2. Snapshot prices — expect ~74 clean, not 74.10000000000001
+    sp = (r1["foba_snap_wide"]["snap_l0_bid_price"]
+          .drop_nulls().head(3).to_list())
+    print(f"Snap L0 bid (expect ~74, max 4dp): {sp}")
+    
+    # 3. Dragonfly volumes — expect multiples of 175
+    vols = (r1["dfly"].filter(pl.col("volume").is_not_null())
+            ["volume"].head(6).to_list())
+    print(f"Dragonfly volumes (LT expect 175,350,525...): {vols}")
+    
+    # 4. passive_direction — must be BUY/SELL only
+    pd_vals = (r1["trades_annotated"]["passive_direction"]
+               .drop_nulls().unique().sort().to_list())
+    print(f"passive_direction unique (must be ['BUY','SELL']): {pd_vals}")
+    
+    # 5. Regime distribution — should NOT be majority none
+    print("Regime dist (none should be <60% not 100%):")
+    print(r1["trades_annotated"].group_by("regime").len().sort("len",
+          descending=True))
+    
+    # 6. FOBA match rate — expect >85%
+    matched = int(r1["trades_foba"]["matched_foba_trade"].sum())
+    total = r1["trades_foba"].height
+    print(f"FOBA match: {matched}/{total} = {matched/total:.1%}")
+    
+    # 7. BBO population — expect >100k rows with valid snap
+    with_bbo = (r1["foba_snap_wide"]
+                .filter(pl.col("snap_l0_bid_price") > 0).height)
+    print(f"Snap rows with valid L0 bid: {with_bbo} (expect >100k)")
+    
+    # 8. Future book not empty
+    r11 = book_results.get(11)
+    if r11:
+        print(f"Book 11 (FUTURE) dfly rows: {r11['dfly'].height} "
+              f"(expect ~7499, was 0 before fix)")
+    
+    print("=== END VERIFICATION ===")
+
+
+thus goes to claude 
+
+after 2k it goes gpt
+
+
+
+I have a Jupyter notebook analyzing futures→options market impact 
+using IMC internal data. The data is already loaded as Polars 
+DataFrames. I need you to fix/write the event tape display correctly.
+
+ALREADY WORKING:
+- Multi-panel orderbook viz (option books per strike)
+- Basic event tape structure
+- Signal regime annotation (buy/sell/both/none)
+
+BROKEN THINGS TO FIX:
+
+1. EVENT TAPE - volume missing on BOOK events
+   - TRADE events show volume correctly e.g. "x260"
+   - JOIN/REMOVE/REDUCE show "x" with nothing after
+   - Fix: pull volume_delta from book_events DataFrame
+
+2. MARKOUT - mk5=NA during active signal, all horizons missing
+   - Currently only shows mk5, need mk0/mk1/mk5/mk10/mk30
+   - mk5=NA specifically when regime=both (worst case - need this most)
+   - Fix: forward asof join on SNAPS to get mid at each horizon
+   - mid = (snap_l0_bid_price + snap_l0_ask_price) / 2
+   - markout_buy = mid(T+X) - mid(T0)
+   - markout_sell = mid(T0) - mid(T+X)
+   - Timestamps all in nanoseconds
+
+3. FUTURES PANEL missing
+   - Currently only shows future price as single number in header
+   - Need full L0/L1/L2 bid+ask price+vol panel same as options
+   - Data in SNAPS[future_book_id]
+
+4. LOT SIZES wrong
+   - Showing hardcoded 200/300
+   - LT lot size is 175, must read from actual data shares_ column
+   - Do NOT hardcode
+
+5. L2 PRICES FROZEN
+   - L0 and L1 update correctly
+   - L2 bid/ask price+vol not updating
+   - Fix in snap_wide join for level 2
+
+6. FLOAT PRECISION
+   - Prices showing as 76.05000000000001
+   - Round all prices to 2 decimal places
+
+DATA STRUCTURE:
+
+SNAPS[book_id] has columns:
+- foreign_id_, foreign_sequence_number_
+- snap_timestamp (nanoseconds)
+- snap_l0_bid_price, snap_l0_bid_vol
+- snap_l0_ask_price, snap_l0_ask_vol
+- snap_l1_bid_price, snap_l1_bid_vol
+- snap_l1_ask_price, snap_l1_ask_vol
+- snap_l2_bid_price, snap_l2_bid_vol
+- snap_l2_ask_price, snap_l2_ask_vol
+- snap_l0_imc_bid_price, snap_l0_imc_bid_vol
+- snap_l0_imc_ask_price, snap_l0_imc_ask_vol
+- bbo_affected_, imc_bbo_affected_
+
+TRADES[book_id] has columns:
+- timestampNanos (nanoseconds)
+- price, foba_trade_price
+- volume, shares_
+- passive_direction, aggressive_direction
+- is_im_c_, is_im_caggressor_
+- profit, credit
+- signal_state, regime
+- buy_signal, sell_signal
+- resting_side_
+- matched_foba_trade
+
+TAPES[book_id] - event tape has columns:
+- event_type (TRADE or BOOK)
+- event_timestamp (nanoseconds)
+- action_clean (TRADE/DIME/JOIN/REDUCE/REMOVE/TRADE_UPDATE)
+- event_direction (BUY/SELL)
+- event_regime
+- foreign_id_, foreign_sequence_number_
+- price (for trades)
+- shares_ (for trades)
+- volume_delta (for book events) ← THIS IS WHAT'S MISSING FROM TAPE
+- price_delta (for book events)
+- signal_state
+
+SIGNAL:
+- signal_lookup_stock has timestamp_ns, buy_signal, sell_signal
+- All nanoseconds
+- Join backward asof to annotate each event with current signal
+
+TIMESTAMP NOTES:
+- Everything in nanoseconds
+- ms_from_event = (ts - reference_ts) / 1_000_000
+- Do NOT mix units
+
+KEY REQUIREMENT:
+When a large future cluster hits I must see:
+- Futures book depleting on aggressed side
+- Option books repricing or staying (that's the edge)
+- IMC queue position per trade
+- Markout colored green/red at multiple horizons
+- Toxic signal windows highlighted
+
+Output: corrected Python functions only, 
+no full notebook rewrite needed.
